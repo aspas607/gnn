@@ -12,6 +12,7 @@ GNN-SAC编队环境接口
 import numpy as np
 from typing import Dict, List, Tuple
 from obstacle_environment_2d import ObstacleEnvironment2D
+from formation_path_planner import plan_path
 
 
 class GNNSACFormationEnv:
@@ -24,7 +25,9 @@ class GNNSACFormationEnv:
                  num_obstacles: int = 5,
                  max_neighbors: int = 4,
                  communication_range: float = 50.0,
-                 dt: float = 0.1):
+                 dt: float = 0.1,
+                 path_resolution: float = 3.0,
+                 waypoint_threshold: float = 6.0):
         """
         初始化环境
         
@@ -41,6 +44,8 @@ class GNNSACFormationEnv:
         self.max_neighbors = max_neighbors
         self.communication_range = communication_range
         self.dt = dt
+        self.path_resolution = path_resolution
+        self.waypoint_threshold = waypoint_threshold
         
         # 创建障碍物环境
         self.obstacle_env = ObstacleEnvironment2D(
@@ -55,13 +60,18 @@ class GNNSACFormationEnv:
         # 目标位置
         self.start_pos = np.array([15.0, 15.0])
         self.goal_pos = np.array([285.0, 285.0])
+        self.current_target = self.goal_pos.copy()
+        self.path_waypoints = []
+        self.current_waypoint_idx = 0
         
         # 健康度（1.0=完全健康，0.0=失效）
         self.health_scores = np.ones(num_agents)
         
         # 编队配置
-        self.formation_spacing = 8.0
-        self.formation_offsets = self._generate_formation_offsets()
+        self.base_formation_spacing = 8.0
+        self.formation_spacing = self.base_formation_spacing
+        self.formation_offsets_base = self._generate_formation_offsets(spacing=1.0)
+        self.formation_offsets = self._apply_formation_spacing(self.formation_spacing)
         
         # 奖励权重
         self.w_formation = 1.0      # 编队保持
@@ -82,7 +92,7 @@ class GNNSACFormationEnv:
         print(f"  障碍物: {num_obstacles}个")
         print(f"  通信范围: {communication_range}m")
     
-    def _generate_formation_offsets(self) -> np.ndarray:
+    def _generate_formation_offsets(self, spacing: float) -> np.ndarray:
         """生成编队偏移量（改进的V型编队）"""
         offsets = np.zeros((self.num_agents, 2))
         
@@ -96,8 +106,8 @@ class GNNSACFormationEnv:
                 side = 1 if i % 2 == 1 else -1
                 position = (i + 1) // 2
                 offsets[i] = np.array([
-                    -position * self.formation_spacing * 0.3,
-                    side * position * self.formation_spacing * 0.5
+                    -position * spacing * 0.3,
+                    side * position * spacing * 0.5
                 ])
         
         # 跟随者：在领航者后方形成V型
@@ -107,11 +117,55 @@ class GNNSACFormationEnv:
             position = (idx + 2) // 2
             
             offsets[i] = np.array([
-                -position * self.formation_spacing * 0.8,
-                side * position * self.formation_spacing * 0.7
+                -position * spacing * 0.8,
+                side * position * spacing * 0.7
             ])
         
         return offsets
+
+    def _apply_formation_spacing(self, spacing: float) -> np.ndarray:
+        """应用编队间距缩放"""
+        return self.formation_offsets_base * spacing
+
+    def _update_formation_spacing(self):
+        """根据障碍物距离动态调整编队间距"""
+        centroid = self._get_centroid()
+        nearest_dist = self.obstacle_env.get_nearest_obstacle_distance(centroid)
+        min_dist = 5.0
+        max_dist = 20.0
+        if nearest_dist <= min_dist:
+            factor = 0.5
+        elif nearest_dist >= max_dist:
+            factor = 1.0
+        else:
+            factor = 0.5 + 0.5 * (nearest_dist - min_dist) / (max_dist - min_dist)
+        self.formation_spacing = self.base_formation_spacing * factor
+        self.formation_offsets = self._apply_formation_spacing(self.formation_spacing)
+
+    def _init_path(self):
+        """初始化全局路径与目标点"""
+        self.path_waypoints = plan_path(
+            self.obstacle_env,
+            start=self.start_pos,
+            goal=self.goal_pos,
+            resolution=self.path_resolution
+        )
+        if not self.path_waypoints:
+            self.path_waypoints = [self.goal_pos.copy()]
+        self.current_waypoint_idx = 0
+        self.current_target = self.path_waypoints[self.current_waypoint_idx].copy()
+
+    def _update_global_target(self):
+        """根据编队质心推进全局路径目标"""
+        centroid = self._get_centroid()
+        if self.current_waypoint_idx < len(self.path_waypoints):
+            waypoint = self.path_waypoints[self.current_waypoint_idx]
+            if np.linalg.norm(centroid - waypoint) <= self.waypoint_threshold:
+                self.current_waypoint_idx = min(
+                    self.current_waypoint_idx + 1,
+                    len(self.path_waypoints) - 1
+                )
+            self.current_target = self.path_waypoints[self.current_waypoint_idx].copy()
     
     def reset(self) -> List[Dict[str, np.ndarray]]:
         """重置环境"""
@@ -120,6 +174,9 @@ class GNNSACFormationEnv:
         self.episode_reward = 0
         self.collision_count = 0
         self.health_scores = np.ones(self.num_agents)
+        self.formation_spacing = self.base_formation_spacing
+        self.formation_offsets = self._apply_formation_spacing(self.formation_spacing)
+        self._init_path()
         
         # 初始化智能体
         for i in range(self.num_agents):
@@ -255,6 +312,8 @@ class GNNSACFormationEnv:
             agent['acceleration'] = acceleration
         
         # 2. 计算奖励
+        self._update_formation_spacing()
+        self._update_global_target()
         rewards = self._compute_rewards()
         
         # 3. 检查终止条件
@@ -276,7 +335,10 @@ class GNNSACFormationEnv:
             'collision_count': self.collision_count,
             'mean_health': np.mean(self.health_scores),
             'formation_error': self._calculate_formation_error(),
-            'goal_distance': np.linalg.norm(self._get_centroid() - self.goal_pos)
+            'goal_distance': np.linalg.norm(self._get_centroid() - self.current_target),
+            'final_goal_distance': np.linalg.norm(self._get_centroid() - self.goal_pos),
+            'current_waypoint': self.current_target.copy(),
+            'formation_spacing': self.formation_spacing
         }
         
         return observations, rewards, dones, info
@@ -312,7 +374,7 @@ class GNNSACFormationEnv:
             
             # 2. 目标趋近奖励（仅领航者）
             if agent['role'] == 'leader':
-                goal_dist = np.linalg.norm(agent['position'] - self.goal_pos)
+                goal_dist = np.linalg.norm(agent['position'] - self.current_target)
                 r_goal = -self.w_goal * goal_dist
             else:
                 r_goal = 0
